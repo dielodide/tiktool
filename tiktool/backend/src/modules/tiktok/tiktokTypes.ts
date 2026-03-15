@@ -49,15 +49,3 @@ export interface TikTokStory {
 export interface TikTokStoryList {
   items: TikTokStory[];
 }
-
-export interface TikTokError {
-  error: string;
-  message: string;
-}
-
-export type TikTokErrorCode =
-  | 'not_found'
-  | 'profile_private'
-  | 'rate_limited'
-  | 'fetch_failed'
-  | 'invalid_username';

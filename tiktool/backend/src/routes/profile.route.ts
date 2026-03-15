@@ -1,46 +1,23 @@
-import { FastifyPluginAsync } from 'fastify';
-import { getProfile } from '../modules/tiktok/tiktokClient';
-import { createError, validateUsername } from '../middlewares/errorHandler';
+import type { FastifyInstance } from 'fastify';
+import { getProfile } from '../modules/tiktok/tiktokClient.js';
 
-interface ProfileParams {
-  username: string;
-}
+const USERNAME_REGEX = /^[a-zA-Z0-9_.]{2,24}$/;
 
-const profileRoute: FastifyPluginAsync = async (fastify) => {
-  fastify.get<{ Params: ProfileParams }>(
+export async function profileRoutes(app: FastifyInstance): Promise<void> {
+  app.get<{ Params: { username: string } }>(
     '/api/profile/:username',
-    {
-      schema: {
-        params: {
-          type: 'object',
-          properties: {
-            username: { type: 'string' },
-          },
-          required: ['username'],
-        },
-      },
-    },
     async (request, reply) => {
       const { username } = request.params;
-
-      if (!validateUsername(username)) {
-        return reply.status(400).send(createError('invalid_username'));
+      if (!USERNAME_REGEX.test(username)) {
+        return reply.status(400).send({ error: 'invalid_username', message: 'Username invalide' });
       }
-
       try {
         const profile = await getProfile(username);
         return reply.send(profile);
-      } catch (err) {
-        const error = err as Error & { response?: { status?: number } };
-
-        if (error.response?.status === 404) {
-          return reply.status(404).send(createError('not_found'));
-        }
-
-        throw err;
+      } catch (err: unknown) {
+        request.log.error(err);
+        return reply.status(500).send({ error: 'fetch_failed', message: 'Impossible de récupérer le profil' });
       }
     }
   );
-};
-
-export default profileRoute;
+}

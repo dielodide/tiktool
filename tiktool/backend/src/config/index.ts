@@ -1,10 +1,5 @@
-import { config as dotenvConfig } from 'dotenv';
-import { resolve } from 'path';
-
-dotenvConfig({ path: resolve(__dirname, '../../../.env') });
-
 export const config = {
-  port: Number(process.env.PORT) || 3432,
+  port: Number(process.env.PORT) || 4000,
   redisUrl: process.env.REDIS_URL || 'redis://127.0.0.1:6379',
   frontendOrigin: process.env.FRONTEND_ORIGIN || 'http://localhost:5173',
   httpProxy: process.env.HTTP_PROXY || undefined,
@@ -14,5 +9,5 @@ export const config = {
   tiktokUserAgent:
     process.env.TIKTOK_USER_AGENT ||
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
-      '(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+    '(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
 };

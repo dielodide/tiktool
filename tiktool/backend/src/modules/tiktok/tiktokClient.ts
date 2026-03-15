@@ -1,284 +1,257 @@
-import axios, { AxiosInstance } from 'axios';
-import { HttpsProxyAgent } from 'https-proxy-agent';
-import pino from 'pino';
-import { config } from '../../config';
-import * as cache from '../../cache/redisClient';
-import {
+import puppeteer, { Browser, Page } from 'puppeteer';
+import { get as cacheGet, set as cacheSet } from '../../cache/redisClient.js';
+import { config } from '../../config/index.js';
+import type {
   TikTokProfile,
+  TikTokVideo,
   TikTokVideoList,
   TikTokStoryList,
-} from './tiktokTypes';
-import {
-  parseProfile,
-  parseVideoList,
-  parseRepostList,
-  parseStoryList,
-} from './tiktokParser';
+} from './tiktokTypes.js';
 
-const logger = pino({ name: 'tiktok-client' });
+const BASE_URL = 'https://tokviewer.net/fr';
+const STORY_URL = 'https://tokviewer.net/fr/tiktok-story-viewer';
+const REPOST_URL = 'https://tokviewer.net/fr/tiktok-repost-viewer';
 
-const profileCache = new Map<string, TikTokProfile>();
+// ── Puppeteer singleton ────────────────────────────────────────────────────
+let browser: Browser | null = null;
 
-function createAxiosInstance(): AxiosInstance {
-  const axiosConfig: Parameters<typeof axios.create>[0] = {
-    timeout: 15000,
-    headers: {
-      'User-Agent': config.tiktokUserAgent,
-      'Accept-Language': 'fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7',
-      Accept:
-        'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-      'Accept-Encoding': 'gzip, deflate, br',
-      Connection: 'keep-alive',
-      'Cache-Control': 'no-cache',
-    },
-  };
-
-  if (config.httpProxy) {
-    axiosConfig.httpsAgent = new HttpsProxyAgent(config.httpProxy);
+async function getBrowser(): Promise<Browser> {
+  if (!browser || !browser.connected) {
+    browser = await puppeteer.launch({
+      headless: true,
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-blink-features=AutomationControlled',
+        '--window-size=1280,800',
+      ],
+    });
   }
-
-  return axios.create(axiosConfig);
+  return browser;
 }
 
-const httpClient = createAxiosInstance();
+async function newStealthPage(b: Browser): Promise<Page> {
+  const page = await b.newPage();
+  await page.setUserAgent(config.tiktokUserAgent);
+  await page.setExtraHTTPHeaders({ 'Accept-Language': 'fr-FR,fr;q=0.9' });
+  // Masquer webdriver
+  await page.evaluateOnNewDocument(() => {
+    Object.defineProperty(navigator, 'webdriver', { get: () => false });
+  });
+  return page;
+}
+
+// ── Helpers internes ───────────────────────────────────────────────────────
+async function submitSearch(page: Page, url: string, username: string): Promise<void> {
+  await page.goto(url, { waitUntil: 'networkidle2', timeout: 30000 });
+
+  // XPath input
+  await page.waitForSelector('input.search', { timeout: 10000 });
+  await page.$eval('input.search', (el: Element, val: string) => {
+    (el as HTMLInputElement).value = val;
+    el.dispatchEvent(new Event('input', { bubbles: true }));
+  }, username);
+
+  // Clic bouton search
+  await page.click('button.search-form__button');
+
+  // Attendre les résultats
+  await page.waitForSelector('.output-component', { timeout: 20000 });
+  // Petite pause pour laisser le rendu se stabiliser
+  await new Promise(r => setTimeout(r, 1500));
+}
+
+// ── parseProfile depuis le DOM tokviewer ───────────────────────────────────
+async function extractProfile(page: Page, username: string): Promise<TikTokProfile> {
+  return page.evaluate((uname: string) => {
+    const avatarEl = document.querySelector<HTMLImageElement>('.avatar__image');
+    const usernameEl = document.querySelector('.user-info__username-text');
+    const statsItems = document.querySelectorAll('.stats__item');
+
+    const statsMap: Record<string, number> = {};
+    statsItems.forEach(item => {
+      const val = item.querySelector('.stats__value')?.textContent?.replace(/\s/g, '') ?? '0';
+      const name = item.querySelector('.stats__name')?.textContent?.trim() ?? '';
+      statsMap[name] = parseInt(val.replace(/[^0-9]/g, ''), 10) || 0;
+    });
+
+    return {
+      username: uname,
+      displayName: usernameEl?.textContent?.replace('@', '').trim() ?? uname,
+      avatarUrl: avatarEl?.src ?? '',
+      bio: '',
+      profileId: '',
+      secUid: '',
+      stats: {
+        followers: statsMap['Followers'] ?? statsMap['followers'] ?? 0,
+        following: statsMap['Suivis'] ?? statsMap['Following'] ?? 0,
+        likes: statsMap["J'aime"] ?? statsMap['Likes'] ?? 0,
+        videosCount: 0,
+      },
+    };
+  }, username);
+}
+
+// ── parseVideos depuis le DOM tokviewer ────────────────────────────────────
+async function extractVideos(page: Page): Promise<TikTokVideo[]> {
+  return page.evaluate(() => {
+    const items = document.querySelectorAll('.profile-media-list__item');
+    const results: TikTokVideo[] = [];
+
+    items.forEach((item, idx) => {
+      const thumb = item.querySelector<HTMLImageElement>('.media-content__image');
+      const dlLink = item.querySelector<HTMLAnchorElement>('a.button--filled');
+      if (!dlLink) return;
+
+      const videoUrl = dlLink.href;
+      const videoId = `tv_${idx}_${Date.now()}`;
+
+      results.push({
+        videoId,
+        description: '',
+        createdAt: new Date().toISOString(),
+        thumbnailUrl: thumb?.src ?? '',
+        videoUrl,
+        stats: { plays: 0, likes: 0, comments: 0, shares: 0 },
+      });
+    });
+
+    return results;
+  });
+}
+
+// ── PUBLIC API ─────────────────────────────────────────────────────────────
 
 export async function getProfile(username: string): Promise<TikTokProfile> {
   const cacheKey = `profile:${username}`;
+  const cached = await cacheGet(cacheKey);
+  if (cached) return JSON.parse(cached);
 
-  const cachedData = await cache.get(cacheKey);
-  if (cachedData) {
-    logger.info({ username }, 'Profile cache hit');
-    const profile = JSON.parse(cachedData) as TikTokProfile;
-    profileCache.set(username, profile);
-    return profile;
-  }
-
-  logger.info({ username }, 'Fetching profile from TikTok');
-
-  const url = `https://www.tiktok.com/@${username}`;
-
+  const b = await getBrowser();
+  const page = await newStealthPage(b);
   try {
-    const response = await httpClient.get<string>(url, {
-      headers: {
-        Referer: 'https://www.tiktok.com/',
-      },
-    });
-
-    const profile = parseProfile(response.data);
-    profileCache.set(username, profile);
-
-    await cache.set(cacheKey, JSON.stringify(profile), config.cacheTtlProfile);
-
+    await submitSearch(page, BASE_URL, username);
+    const profile = await extractProfile(page, username);
+    const videos = await extractVideos(page);
+    profile.stats.videosCount = videos.length;
+    await cacheSet(cacheKey, JSON.stringify(profile), config.cacheTtlProfile);
     return profile;
-  } catch (err) {
-    logger.error({ username, err }, 'Failed to fetch profile');
-    throw err;
+  } finally {
+    await page.close();
   }
 }
 
 export async function getVideos(
   username: string,
-  cursor?: string,
+  cursor = '0',
   limit = 20
 ): Promise<TikTokVideoList> {
-  const cacheKey = `videos:${username}:${cursor || '0'}`;
+  const cacheKey = `videos:${username}:${cursor}`;
+  const cached = await cacheGet(cacheKey);
+  if (cached) return JSON.parse(cached);
 
-  const cachedData = await cache.get(cacheKey);
-  if (cachedData) {
-    logger.info({ username, cursor }, 'Videos cache hit');
-    return JSON.parse(cachedData) as TikTokVideoList;
-  }
-
-  let profile = profileCache.get(username);
-  if (!profile) {
-    profile = await getProfile(username);
-  }
-
-  logger.info({ username, cursor, limit }, 'Fetching videos from TikTok API');
-
-  const url = 'https://www.tiktok.com/api/post/item_list/';
-
+  const b = await getBrowser();
+  const page = await newStealthPage(b);
   try {
-    const response = await httpClient.get(url, {
-      params: {
-        secUid: profile.secUid,
-        count: Math.min(limit, 30),
-        cursor: cursor || '0',
-        aid: 1988,
-        app_language: 'fr',
-        app_name: 'tiktok_web',
-      },
-      headers: {
-        Referer: `https://www.tiktok.com/@${username}`,
-      },
-    });
+    await submitSearch(page, BASE_URL, username);
 
-    const videoList = parseVideoList(response.data);
+    // Charger plus si cursor > 0
+    const cursorNum = parseInt(cursor, 10) || 0;
+    for (let i = 0; i < cursorNum; i++) {
+      const seeMoreBtn = await page.$('button.profile-media-list__button--see-more');
+      if (!seeMoreBtn) break;
+      await seeMoreBtn.click();
+      await new Promise(r => setTimeout(r, 1500));
+    }
 
-    await cache.set(cacheKey, JSON.stringify(videoList), config.cacheTtlVideos);
+    const allVideos = await extractVideos(page);
+    const items = allVideos.slice(0, limit);
+    const nextCursor = allVideos.length >= limit ? String(cursorNum + 1) : null;
 
-    return videoList;
-  } catch (err) {
-    logger.error({ username, err }, 'Failed to fetch videos');
-    throw err;
+    const result: TikTokVideoList = { items, nextCursor };
+    await cacheSet(cacheKey, JSON.stringify(result), config.cacheTtlVideos);
+    return result;
+  } finally {
+    await page.close();
   }
 }
 
 export async function getReposts(
   username: string,
-  cursor?: string
+  cursor = '0'
 ): Promise<TikTokVideoList> {
-  const cacheKey = `reposts:${username}:${cursor || '0'}`;
+  const cacheKey = `reposts:${username}:${cursor}`;
+  const cached = await cacheGet(cacheKey);
+  if (cached) return JSON.parse(cached);
 
-  const cachedData = await cache.get(cacheKey);
-  if (cachedData) {
-    logger.info({ username, cursor }, 'Reposts cache hit');
-    return JSON.parse(cachedData) as TikTokVideoList;
-  }
-
-  let profile = profileCache.get(username);
-  if (!profile) {
-    profile = await getProfile(username);
-  }
-
-  logger.info({ username, cursor }, 'Fetching reposts from TikTok API');
-
-  const url = 'https://www.tiktok.com/api/user/repost/';
-
+  const b = await getBrowser();
+  const page = await newStealthPage(b);
   try {
-    const response = await httpClient.get(url, {
-      params: {
-        secUid: profile.secUid,
-        count: 20,
-        cursor: cursor || '0',
-      },
-      headers: {
-        Referer: `https://www.tiktok.com/@${username}`,
-      },
-    });
-
-    const repostList = parseRepostList(response.data);
-
-    await cache.set(cacheKey, JSON.stringify(repostList), config.cacheTtlVideos);
-
-    return repostList;
-  } catch (err) {
-    logger.error({ username, err }, 'Failed to fetch reposts');
-    throw err;
+    await submitSearch(page, REPOST_URL, username);
+    const items = await extractVideos(page);
+    // Marquer comme repost
+    const tagged = items.map(v => ({ ...v, isRepost: true }));
+    const result: TikTokVideoList = { items: tagged, nextCursor: null };
+    await cacheSet(cacheKey, JSON.stringify(result), config.cacheTtlVideos);
+    return result;
+  } finally {
+    await page.close();
   }
 }
 
 export async function getStories(username: string): Promise<TikTokStoryList> {
   const cacheKey = `stories:${username}`;
+  const cached = await cacheGet(cacheKey);
+  if (cached) return JSON.parse(cached);
 
-  const cachedData = await cache.get(cacheKey);
-  if (cachedData) {
-    logger.info({ username }, 'Stories cache hit');
-    return JSON.parse(cachedData) as TikTokStoryList;
-  }
-
-  let profile = profileCache.get(username);
-  if (!profile) {
-    profile = await getProfile(username);
-  }
-
-  logger.info({ username }, 'Fetching stories from TikTok API');
-
-  const url = 'https://www.tiktok.com/api/user/story/list/';
-
+  const b = await getBrowser();
+  const page = await newStealthPage(b);
   try {
-    const response = await httpClient.get(url, {
-      params: {
-        secUid: profile.secUid,
-      },
-      headers: {
-        Referer: `https://www.tiktok.com/@${username}`,
-      },
+    await submitSearch(page, STORY_URL, username);
+
+    const items = await page.evaluate(() => {
+      const storyItems = document.querySelectorAll('.profile-media-list__item');
+      const results: Array<{
+        storyId: string;
+        mediaType: 'video' | 'image';
+        mediaUrl: string;
+        thumbnailUrl: string;
+        createdAt: string;
+        expiresAt: string;
+      }> = [];
+
+      storyItems.forEach((item, idx) => {
+        const thumb = item.querySelector<HTMLImageElement>('.media-content__image');
+        const dlLink = item.querySelector<HTMLAnchorElement>('a.button--filled');
+        if (!dlLink) return;
+
+        const mediaUrl = dlLink.href;
+        const isVideo = mediaUrl.includes('video') || mediaUrl.includes('.mp4');
+        const now = new Date();
+        const exp = new Date(now.getTime() + 24 * 3600 * 1000);
+
+        results.push({
+          storyId: `story_${idx}_${Date.now()}`,
+          mediaType: isVideo ? 'video' : 'image',
+          mediaUrl,
+          thumbnailUrl: thumb?.src ?? '',
+          createdAt: now.toISOString(),
+          expiresAt: exp.toISOString(),
+        });
+      });
+
+      return results;
     });
 
-    const storyList = parseStoryList(response.data);
-
-    await cache.set(cacheKey, JSON.stringify(storyList), 60);
-
-    return storyList;
-  } catch (err) {
-    logger.error({ username, err }, 'Failed to fetch stories');
-    throw err;
+    const result: TikTokStoryList = { items };
+    await cacheSet(cacheKey, JSON.stringify(result), 60);
+    return result;
+  } finally {
+    await page.close();
   }
 }
-
-const videoUrlCache = new Map<string, string>();
 
 export async function resolveVideoUrl(videoId: string): Promise<string> {
-  const cached = videoUrlCache.get(videoId);
-  if (cached) {
-    return cached;
-  }
-
-  const cacheKey = `videourl:${videoId}`;
-  const cachedData = await cache.get(cacheKey);
-  if (cachedData) {
-    videoUrlCache.set(videoId, cachedData);
-    return cachedData;
-  }
-
-  logger.info({ videoId }, 'Resolving video URL');
-
-  const url = `https://www.tiktok.com/api/item/detail/`;
-
-  try {
-    const response = await httpClient.get(url, {
-      params: {
-        itemId: videoId,
-      },
-      headers: {
-        Referer: 'https://www.tiktok.com/',
-      },
-    });
-
-    interface ItemDetailResponse {
-      itemInfo?: {
-        itemStruct?: {
-          video?: {
-            downloadAddr?: string;
-            playAddr?: string;
-          };
-        };
-      };
-    }
-
-    const data = response.data as ItemDetailResponse;
-    const videoUrl =
-      data.itemInfo?.itemStruct?.video?.downloadAddr ||
-      data.itemInfo?.itemStruct?.video?.playAddr ||
-      '';
-
-    if (videoUrl) {
-      videoUrlCache.set(videoId, videoUrl);
-      await cache.set(cacheKey, videoUrl, 3600);
-    }
-
-    return videoUrl;
-  } catch (err) {
-    logger.error({ videoId, err }, 'Failed to resolve video URL');
-    throw err;
-  }
-}
-
-export async function resolveStoryUrl(storyId: string): Promise<{
-  url: string;
-  mediaType: 'video' | 'image';
-}> {
-  const cacheKey = `storyurl:${storyId}`;
-  const cachedData = await cache.get(cacheKey);
-  if (cachedData) {
-    return JSON.parse(cachedData) as { url: string; mediaType: 'video' | 'image' };
-  }
-
-  logger.warn({ storyId }, 'Story URL resolution not fully implemented');
-
-  return {
-    url: '',
-    mediaType: 'video',
-  };
+  const cached = await cacheGet(`videourl:${videoId}`);
+  return cached ?? '';
 }

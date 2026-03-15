@@ -1,63 +1,28 @@
-import { FastifyPluginAsync } from 'fastify';
-import { getVideos } from '../modules/tiktok/tiktokClient';
-import { createError, validateUsername } from '../middlewares/errorHandler';
+import type { FastifyInstance } from 'fastify';
+import { getVideos } from '../modules/tiktok/tiktokClient.js';
 
-interface VideosParams {
-  username: string;
-}
+const USERNAME_REGEX = /^[a-zA-Z0-9_.]{2,24}$/;
 
-interface VideosQuery {
-  cursor?: string;
-  limit?: number;
-}
-
-const videosRoute: FastifyPluginAsync = async (fastify) => {
-  fastify.get<{ Params: VideosParams; Querystring: VideosQuery }>(
+export async function videosRoutes(app: FastifyInstance): Promise<void> {
+  app.get<{
+    Params: { username: string };
+    Querystring: { cursor?: string; limit?: string };
+  }>(
     '/api/profile/:username/videos',
-    {
-      schema: {
-        params: {
-          type: 'object',
-          properties: {
-            username: { type: 'string' },
-          },
-          required: ['username'],
-        },
-        querystring: {
-          type: 'object',
-          properties: {
-            cursor: { type: 'string' },
-            limit: { type: 'number', maximum: 30 },
-          },
-        },
-      },
-    },
     async (request, reply) => {
       const { username } = request.params;
-      const { cursor, limit } = request.query;
-
-      if (!validateUsername(username)) {
-        return reply.status(400).send(createError('invalid_username'));
+      if (!USERNAME_REGEX.test(username)) {
+        return reply.status(400).send({ error: 'invalid_username', message: 'Username invalide' });
       }
-
+      const cursor = request.query.cursor ?? '0';
+      const limit = Math.min(parseInt(request.query.limit ?? '20', 10), 30);
       try {
-        const videos = await getVideos(
-          username,
-          cursor,
-          limit ? Math.min(limit, 30) : 20
-        );
-        return reply.send(videos);
+        const result = await getVideos(username, cursor, limit);
+        return reply.send(result);
       } catch (err) {
-        const error = err as Error & { response?: { status?: number } };
-
-        if (error.response?.status === 404) {
-          return reply.status(404).send(createError('not_found'));
-        }
-
-        throw err;
+        request.log.error(err);
+        return reply.status(500).send({ error: 'fetch_failed', message: 'Impossible de récupérer les vidéos' });
       }
     }
   );
-};
-
-export default videosRoute;
+}
