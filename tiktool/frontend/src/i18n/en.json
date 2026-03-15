@@ -1,0 +1,22 @@
+{
+  "home.title": "TikTool Viewer",
+  "home.placeholder": "@username",
+  "home.cta": "View TikTok Profile",
+  "home.anonymous": "100% anonymous - no login required",
+  "profile.tabs.profile": "Profile",
+  "profile.tabs.videos": "Videos",
+  "profile.tabs.reposts": "Reposts",
+  "profile.tabs.stories": "Stories",
+  "profile.followers": "followers",
+  "profile.following": "following",
+  "profile.likes": "likes",
+  "profile.videos": "videos",
+  "profile.download": "Download",
+  "profile.loadMore": "Load more",
+  "profile.noContent": "No content available.",
+  "error.not_found": "Profile not found or private.",
+  "error.rate_limited": "Too many requests. Please try again in a few seconds.",
+  "error.fetch_failed": "Failed to fetch data.",
+  "error.invalid_username": "Invalid username.",
+  "error.profile_private": "This profile is private."
+}
